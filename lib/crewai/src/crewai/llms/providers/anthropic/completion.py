@@ -67,7 +67,20 @@ _MAX_OUTPUT_TOKENS_BY_PREFIX: Final[tuple[tuple[str, int], ...]] = (
     ("claude-opus-4-5", 64000),
 )
 _DEFAULT_MODEL_MAX_TOKENS: Final[int] = 32000
+# Models that reject forced tool use (tool_choice "any"/"tool") with a 400.
+_NO_FORCED_TOOL_CHOICE_PREFIXES: Final[tuple[str, ...]] = (
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+)
 DEFAULT_MODEL: Final[str] = "claude-sonnet-4-6"
+
+
+def _supports_forced_tool_choice(model: str) -> bool:
+    """Return False for models that only accept tool_choice "auto"/"none"."""
+    name = model.rsplit("/", 1)[-1].lower()
+    return not name.startswith(_NO_FORCED_TOOL_CHOICE_PREFIXES)
 
 
 def _default_max_tokens_for_model(model: str) -> int:
@@ -207,6 +220,20 @@ def _is_tool_use_block(block: Any) -> TypeGuard[_AnthropicToolUseBlock]:
     )
 
 
+def _thinking_block_dict(block: Any) -> dict[str, Any] | None:
+    """Return a replayable dict for a thinking/redacted_thinking block, else None."""
+    block_type = getattr(block, "type", None)
+    if block_type == "thinking":
+        return {
+            "type": "thinking",
+            "thinking": getattr(block, "thinking", ""),
+            "signature": getattr(block, "signature", ""),
+        }
+    if block_type == "redacted_thinking":
+        return {"type": "redacted_thinking", "data": getattr(block, "data", "")}
+    return None
+
+
 def _tool_use_blocks(blocks: list[Any]) -> list[_AnthropicToolUseBlock]:
     return [block for block in blocks if _is_tool_use_block(block)]
 
@@ -271,6 +298,10 @@ class AnthropicCompletion(BaseLLM):
     _client: Any = PrivateAttr(default=None)
     _async_client: Any = PrivateAttr(default=None)
     _previous_thinking_blocks: list[Any] = PrivateAttr(default_factory=list)
+    # Thinking blocks that preceded each tool_use, keyed by tool_use id. Models
+    # that always think (e.g. Opus 5.5) reject a tool-use continuation whose
+    # assistant turn lost its thinking blocks, so they are replayed verbatim.
+    _thinking_by_tool_use_id: dict[str, list[Any]] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -581,7 +612,11 @@ class AnthropicCompletion(BaseLLM):
 
             params["tools"] = converted_tools
 
-            if available_functions and len(regular_tools) == 1:
+            if (
+                available_functions
+                and len(regular_tools) == 1
+                and _supports_forced_tool_choice(self.model)
+            ):
                 tool_name = regular_tools[0].get("name")
                 if tool_name and tool_name in available_functions:
                     params["tool_choice"] = {"type": "tool", "name": tool_name}
@@ -687,6 +722,15 @@ class AnthropicCompletion(BaseLLM):
             result.append(tool)
 
         return result
+
+    def _remember_tool_use_thinking(self, blocks: list[Any]) -> None:
+        """Store this response's thinking blocks under each of its tool_use ids."""
+        thinking = [d for d in map(_thinking_block_dict, blocks) if d is not None]
+        if not thinking:
+            return
+        for block in blocks:
+            if getattr(block, "type", None) == "tool_use":
+                self._thinking_by_tool_use_id[block.id] = thinking
 
     def _extract_thinking_block(
         self, content_block: Any
@@ -878,6 +922,14 @@ class AnthropicCompletion(BaseLLM):
                 tool_calls = message.get("tool_calls", [])
                 if tool_calls:
                     assistant_content: list[dict[str, Any]] = []
+                    first_id = (
+                        tool_calls[0].get("id", "")
+                        if isinstance(tool_calls[0], dict)
+                        else ""
+                    )
+                    assistant_content.extend(
+                        self._thinking_by_tool_use_id.get(first_id, [])
+                    )
                     for tc in tool_calls:
                         if isinstance(tc, dict):
                             func = tc.get("function", {})
@@ -1096,6 +1148,7 @@ class AnthropicCompletion(BaseLLM):
         # Check if Claude wants to use tools
         if response.content:
             tool_uses = _tool_use_blocks(list(response.content))
+            self._remember_tool_use_thinking(list(response.content))
 
             if tool_uses:
                 # Without available_functions, return tool calls so the executor can
@@ -1328,6 +1381,7 @@ class AnthropicCompletion(BaseLLM):
 
         if final_message.content:
             tool_uses = _tool_use_blocks(list(final_message.content))
+            self._remember_tool_use_thinking(list(final_message.content))
 
             if tool_uses:
                 if not available_functions:
@@ -1644,6 +1698,7 @@ class AnthropicCompletion(BaseLLM):
         # Handle Anthropic tool-use blocks across stable, beta, and preview SDK shapes.
         if response.content:
             tool_uses = _tool_use_blocks(list(response.content))
+            self._remember_tool_use_thinking(list(response.content))
 
             if tool_uses:
                 if not available_functions:
@@ -1852,6 +1907,7 @@ class AnthropicCompletion(BaseLLM):
 
         if final_message.content:
             tool_uses = _tool_use_blocks(list(final_message.content))
+            self._remember_tool_use_thinking(list(final_message.content))
 
             if tool_uses:
                 if not available_functions:

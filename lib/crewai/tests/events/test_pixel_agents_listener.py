@@ -149,3 +149,21 @@ def test_crew_run_is_forwarded_as_hook_events(office: list[Any]) -> None:
     assert events[0]["agent_role"] == "Researcher"
     assert events[1]["tool_input"] == {"description": "Research pixel art"}
     assert events[2]["tool_name"] == "search"
+
+
+def test_session_ids_map_agents_onto_existing_characters(office: list[Any]) -> None:
+    agent = Agent(role="Writer", goal="Write", backstory="Wordsmith")
+    task = Task(description="Write a poem", expected_output="Poem", agent=agent)
+
+    with crewai_event_bus.scoped_handlers():
+        PixelAgentsListener(session_ids={str(agent.id): "worker-42"})
+        crewai_event_bus.emit(
+            agent,
+            AgentExecutionStartedEvent(
+                agent=agent, task=task, tools=[], task_prompt="Write a poem"
+            ),
+        )
+        crewai_event_bus.flush()
+
+    _wait_for(office, 2)
+    assert {body["session_id"] for _, _, body in office} == {"worker-42"}

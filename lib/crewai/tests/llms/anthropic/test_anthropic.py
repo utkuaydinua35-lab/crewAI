@@ -1347,6 +1347,40 @@ def test_tool_search_passthrough_preserves_tool_search_type():
     assert "input_schema" in converted[1]
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"],
+)
+def test_single_tool_not_forced_for_models_rejecting_forced_tool_choice(model):
+    """These models 400 on tool_choice "tool"; a single tool must stay on auto."""
+    llm = LLM(model=f"anthropic/{model}")
+    crewai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "test_tool",
+                "description": "A test tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            },
+        },
+    ]
+    formatted_messages, system_message = llm._format_messages_for_anthropic(
+        [{"role": "user", "content": "Hello"}]
+    )
+    params = llm._prepare_completion_params(
+        formatted_messages,
+        system_message,
+        crewai_tools,
+        available_functions={"test_tool": lambda q: "result"},
+    )
+    assert len(params["tools"]) == 1
+    assert "tool_choice" not in params
+
+
 def test_tool_search_single_tool_skips_search_and_forces_choice():
     """With only 1 tool, tool_search is skipped (nothing to search) and the
     normal forced tool_choice optimisation still applies."""
@@ -2025,3 +2059,41 @@ def test_max_iterations_request_ends_on_a_user_turn(history_tail):
     sent = mock_client.messages.create.call_args.kwargs["messages"]
     assert sent[-1] == {"role": "user", "content": I18N_DEFAULT.errors("force_final_answer")}
     assert result.output == "42"
+
+
+def test_tool_use_thinking_blocks_are_replayed_with_their_tool_call():
+    """Always-thinking models need the thinking that preceded a tool_use replayed
+    verbatim in front of it when the tool result is sent back."""
+    from types import SimpleNamespace
+
+    llm = LLM(model="anthropic/claude-opus-5-5")
+    llm._remember_tool_use_thinking(
+        [
+            SimpleNamespace(type="thinking", thinking="", signature="sig-1"),
+            SimpleNamespace(type="tool_use", id="toolu_1", name="search", input={}),
+        ]
+    )
+    formatted, _ = llm._format_messages_for_anthropic(
+        [
+            {"role": "user", "content": "Find it"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "found"},
+        ]
+    )
+    assistant = next(m for m in formatted if m["role"] == "assistant")
+    assert assistant["content"][0] == {
+        "type": "thinking",
+        "thinking": "",
+        "signature": "sig-1",
+    }
+    assert assistant["content"][1]["type"] == "tool_use"

@@ -21,6 +21,7 @@ running, events are dropped and the crew is unaffected.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import os
 from pathlib import Path
@@ -106,14 +107,19 @@ def discover_servers() -> list[tuple[int, str]]:
     return servers
 
 
-def _session_id(agent_id: Any) -> str | None:
-    return f"crewai-{agent_id}" if agent_id else None
-
-
 class PixelAgentsListener(BaseEventListener):
     """Forwards crew, agent and tool events to running Pixel Agents servers."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_ids: Mapping[str, str] | None = None) -> None:
+        """Create the listener.
+
+        Args:
+            session_ids: Optional map from ``str(agent.id)`` to the office session
+                id of a character that already exists (e.g. a worker the office
+                created), so the agent animates that character instead of
+                spawning a new one.
+        """
+        self._session_ids = dict(session_ids or {})
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lock = threading.Lock()
         self._open_sessions: set[str] = set()
@@ -149,6 +155,11 @@ class PixelAgentsListener(BaseEventListener):
 
     # ── session bookkeeping ──
 
+    def _session_id(self, agent_id: Any) -> str | None:
+        if not agent_id:
+            return None
+        return self._session_ids.get(str(agent_id), f"crewai-{agent_id}")
+
     def _ensure_session(self, session_id: str, agent_role: str | None) -> None:
         with self._lock:
             if session_id in self._open_sessions:
@@ -180,7 +191,7 @@ class PixelAgentsListener(BaseEventListener):
     def setup_listeners(self, crewai_event_bus: CrewAIEventsBus) -> None:
         @crewai_event_bus.on(AgentExecutionStartedEvent)
         def on_agent_started(_: Any, event: AgentExecutionStartedEvent) -> None:
-            session_id = _session_id(getattr(event.agent, "id", None))
+            session_id = self._session_id(getattr(event.agent, "id", None))
             if not session_id:
                 return
             self._ensure_session(session_id, getattr(event.agent, "role", None))
@@ -201,7 +212,7 @@ class PixelAgentsListener(BaseEventListener):
         def on_agent_finished(
             _: Any, event: AgentExecutionCompletedEvent | AgentExecutionErrorEvent
         ) -> None:
-            session_id = _session_id(getattr(event.agent, "id", None))
+            session_id = self._session_id(getattr(event.agent, "id", None))
             if not session_id:
                 return
             self._send({"hook_event_name": "PostToolUse", "session_id": session_id})
@@ -209,7 +220,7 @@ class PixelAgentsListener(BaseEventListener):
 
         @crewai_event_bus.on(ToolUsageStartedEvent)
         def on_tool_started(_: Any, event: ToolUsageStartedEvent) -> None:
-            session_id = _session_id(event.agent_id)
+            session_id = self._session_id(event.agent_id)
             if not session_id:
                 return
             self._ensure_session(session_id, event.agent_role)
@@ -226,7 +237,7 @@ class PixelAgentsListener(BaseEventListener):
         def on_tool_finished(
             _: Any, event: ToolUsageFinishedEvent | ToolUsageErrorEvent
         ) -> None:
-            session_id = _session_id(event.agent_id)
+            session_id = self._session_id(event.agent_id)
             if session_id:
                 self._send({"hook_event_name": "PostToolUse", "session_id": session_id})
 
