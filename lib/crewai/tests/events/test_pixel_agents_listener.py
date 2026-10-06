@@ -147,6 +147,7 @@ def test_crew_run_is_forwarded_as_hook_events(office: list[Any]) -> None:
     ]
     assert {e["session_id"] for e in events} == {f"crewai-{agent.id}"}
     assert events[0]["agent_role"] == "Researcher"
+    assert events[1]["tool_name"] == "CrewTask"
     assert events[1]["tool_input"] == {"description": "Research pixel art"}
     assert events[2]["tool_name"] == "search"
 

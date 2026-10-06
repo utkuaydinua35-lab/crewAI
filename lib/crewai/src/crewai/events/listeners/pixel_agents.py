@@ -200,7 +200,7 @@ class PixelAgentsListener(BaseEventListener):
                 {
                     "hook_event_name": "PreToolUse",
                     "session_id": session_id,
-                    "tool_name": "Task",
+                    "tool_name": "CrewTask",
                     "tool_input": {
                         "description": description[:TASK_DESCRIPTION_MAX_LENGTH]
                     },
